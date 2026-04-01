@@ -1,75 +1,55 @@
-# React + TypeScript + Vite
+# String String
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A text physics rope toy — type words, pull the thread.
 
-Currently, two official plugins are available:
+Each line of text becomes a physical rope chain. Click and drag to unleash gravity, place collision shapes, and watch characters bounce on a trampoline floor.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+**[Live Demo](https://mowtwo.github.io/string-string/)**
 
-## React Compiler
+## Features
 
-The React Compiler is enabled on this template. See [this documentation](https://react.dev/learn/react-compiler) for more information.
+- **Text as Rope** — Each line becomes a connected chain of character bodies. Click & drag to activate physics.
+- **Collision Shapes** — Draw circles, triangles, and squares on the canvas. Text ropes bounce off them.
+- **Trampoline Floor** — Bouncy floor with ripple wave animation on impact. Adjustable restitution (0–2x).
+- **FPS Collider** — The FPS counter is a physical object that text collides with.
+- **Canvas Zoom & Pan** — Scroll to zoom, right-click drag to pan.
+- **Undo/Redo** — Full undo/redo stack for shape operations.
+- **Settings Panel** — Bounce strength, floor height, FPS toggle. All saved to localStorage.
 
-Note: This will impact Vite dev & build performances.
+## Keyboard Shortcuts
 
-## Expanding the ESLint configuration
+| Key | Action |
+|---|---|
+| `Esc` | Drag mode |
+| `1` / `2` / `3` | Circle / Triangle / Square tool |
+| `Ctrl+Z` | Undo shape |
+| `Ctrl+Shift+Z` | Redo shape |
+| `Delete` | Remove selected shape |
+| `R` | Reset text |
+| `+` / `-` | Zoom in / out |
+| `0` | Reset zoom |
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## Tech Stack
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+- React 19 + TypeScript
+- Vite 8
+- Matter.js 0.20 (physics engine)
+- Canvas 2D with OffscreenCanvas glyph caching
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+## Development
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+pnpm install
+pnpm dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Build
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+pnpm build
+pnpm preview
 ```
+
+## Notes
+
+This project includes a workaround for a Matter.js 0.20 bug: bodies must be created in dynamic mode first, then set to static via `Body.setStatic(body, true)`. Creating with `isStatic: true` in options causes mass restoration to fail (NaN physics).

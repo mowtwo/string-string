@@ -4,10 +4,12 @@ import './App.css'
 
 const { Engine, Composite, Bodies, Body, Constraint, Events } = Matter
 
-const FONT_SIZE = 20
-const LINE_HEIGHT = 32
-const PAD = 40
+const FONT_SIZE = 15
+const LINE_HEIGHT = 24
+const PAD = 28
 const FONT = `${FONT_SIZE}px "DM Mono", monospace`
+const MAX_CHARS_PER_LINE = 500
+const MIN_LAYOUT_W = 320 // minimum text layout width
 const DEFAULT_TEXT =
   'Every string has two meanings\n\nThe one you type\nand the one that pulls'
 
@@ -15,6 +17,7 @@ type ShapeKind = 'circle' | 'triangle' | 'square'
 type ToolMode = 'drag' | ShapeKind
 
 interface CB { ch: string; body: Matter.Body; w: number }
+interface RopeLine { chars: CB[]; released: boolean; pins: Matter.Constraint[] }
 interface PlacedShape { body: Matter.Body; kind: ShapeKind; size: number }
 
 /* ── localStorage helpers ── */
@@ -73,7 +76,7 @@ export default function App() {
     }
     return engineRef.current
   }
-  const linesRef = useRef<CB[][]>([])
+  const linesRef = useRef<RopeLine[]>([])
   const shapesRef = useRef<PlacedShape[]>([])
   const redoRef = useRef<PlacedShape[]>([])
   const wallsRef = useRef<Matter.Body[]>([])
@@ -120,6 +123,7 @@ export default function App() {
     const loop = (t: number) => {
       const dt = last ? Math.min(t - last, 33) : 16.67; last = t
       Engine.update(engine, dt)
+      if (physRef.current) updatePins()
 
       // fps
       const fps = fpsRef.current
@@ -251,10 +255,10 @@ export default function App() {
         if (physRef.current) {
           ctx.strokeStyle = 'rgba(232,67,40,0.25)'; ctx.lineWidth = 1.5 / z
           for (const line of lines) {
-            if (line.length < 2) continue
+            if (line.chars.length < 2) continue
             ctx.beginPath()
-            for (let i = 0; i < line.length; i++) {
-              const p = line[i].body.position
+            for (let i = 0; i < line.chars.length; i++) {
+              const p = line.chars[i].body.position
               i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)
             }
             ctx.stroke()
@@ -264,7 +268,7 @@ export default function App() {
         // characters — use cached glyph bitmaps for speed
         const cache = glyphCache.current
         for (const line of lines) {
-          for (const { ch, body, w } of line) {
+          for (const { ch, body, w } of line.chars) {
             if (!ch.trim()) continue
             let glyph = cache.get(ch)
             if (!glyph) { glyph = renderGlyph(ch, w); cache.set(ch, glyph) }
@@ -390,6 +394,38 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  /* ═══════ resize: update canvas + move walls to push text ═══════ */
+  useEffect(() => {
+    const onResize = () => {
+      if (!fullscreenRef.current) return
+      const canvas = canvasRef.current; if (!canvas) return
+      const w = window.innerWidth, h = window.innerHeight
+      canvas.width = w; canvas.height = h
+      // reposition walls
+      const walls = wallsRef.current
+      if (walls.length >= 3) {
+        const fh = floorHRef.current
+        Body.setPosition(walls[0], { x: w / 2, y: h - fh + 25 })
+        Body.setPosition(walls[1], { x: -25, y: h / 2 })
+        Body.setPosition(walls[2], { x: w + 25, y: h / 2 })
+      }
+      if (fpsBodyRef.current) Body.setPosition(fpsBodyRef.current, { x: w - 60, y: 70 })
+      // rescue out-of-bounds bodies → teleport to top and re-drop
+      const margin = 80
+      for (const line of linesRef.current) {
+        for (const { body } of line.chars) {
+          const bx = body.position.x, by = body.position.y
+          if (bx < -margin || bx > w + margin || by < -margin || by > h + margin) {
+            Body.setPosition(body, { x: w / 2 + (Math.random() - 0.5) * 200, y: 60 })
+            Body.setVelocity(body, { x: 0, y: 0 })
+          }
+        }
+      }
+    }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
   const applyZoom = (factor: number, cx: number, cy: number) => {
     const oldZ = zoomRef.current, newZ = Math.max(0.2, Math.min(5, oldZ * factor))
     panRef.current.x = cx - (cx - panRef.current.x) * (newZ / oldZ)
@@ -417,29 +453,63 @@ export default function App() {
     const w = window.innerWidth, h = window.innerHeight
     canvas.width = w; canvas.height = h
     const ctx = canvas.getContext('2d')!; ctx.font = FONT
-    const maxW = w - PAD * 2; const allLines: CB[][] = []
-    let x = PAD, y = PAD + FONT_SIZE
+    const layoutW = Math.max(MIN_LAYOUT_W, w - PAD * 2)
+    const allLines: RopeLine[] = []
+    const layoutLeft = PAD // will be centered per row after placement
+    let x = 0, y = 72 + FONT_SIZE
 
-    for (const rawLine of text.split('\n')) {
+    for (let rawLine of text.split('\n')) {
       if (rawLine.trim() === '') { y += LINE_HEIGHT; continue }
-      const group = Body.nextGroup(true); const lineChars: CB[] = []
+      if (rawLine.length > MAX_CHARS_PER_LINE) rawLine = rawLine.slice(0, MAX_CHARS_PER_LINE) + '...'
+      const group = Body.nextGroup(true)
+      const visualRows: CB[][] = []
+      let currentRow: CB[] = []
+      x = 0 // x is now relative, will be centered later
+
       for (const seg of rawLine.split(/(\s+)/)) {
         if (seg.length === 0) continue
         const segW = ctx.measureText(seg).width
-        if (seg.trim() && x - PAD + segW > maxW && x > PAD) { x = PAD; y += LINE_HEIGHT }
+        if (seg.trim() && x + segW > layoutW && x > 0) {
+          if (currentRow.length > 0) { visualRows.push(currentRow); currentRow = [] }
+          x = 0; y += LINE_HEIGHT
+        }
         for (const c of seg) {
           const cw = ctx.measureText(c).width
-          const body = Bodies.rectangle(x + cw / 2, y, Math.max(cw, 8), FONT_SIZE + 4, {
+          if (x + cw > layoutW && x > 0) {
+            if (currentRow.length > 0) { visualRows.push(currentRow); currentRow = [] }
+            x = 0; y += LINE_HEIGHT
+          }
+          // place at temporary x, will be shifted to center
+          const body = Bodies.rectangle(layoutLeft + x + cw / 2, y, Math.max(cw, 6), FONT_SIZE + 3, {
             restitution: 0.5, friction: 0.3, frictionAir: 0.02, density: 0.002,
             collisionFilter: { group },
           })
           Body.setStatic(body, true)
-          lineChars.push({ ch: c, body, w: cw })
+          currentRow.push({ ch: c, body, w: cw })
           Composite.add(engine.world, body); x += cw
         }
       }
-      if (lineChars.length > 0) allLines.push(lineChars)
-      x = PAD; y += LINE_HEIGHT
+      if (currentRow.length > 0) visualRows.push(currentRow)
+
+      // center each visual row horizontally
+      for (const row of visualRows) {
+        if (row.length === 0) continue
+        const first = row[0].body.position.x - row[0].w / 2
+        const last = row[row.length - 1].body.position.x + row[row.length - 1].w / 2
+        const rowW = last - first
+        const shift = (w - rowW) / 2 - first
+        for (const { body } of row) Body.setPosition(body, { x: body.position.x + shift, y: body.position.y })
+      }
+
+      // S-pattern chain
+      const lineChars: CB[] = []
+      for (let r = 0; r < visualRows.length; r++) {
+        if (r % 2 === 0) lineChars.push(...visualRows[r])
+        else lineChars.push(...[...visualRows[r]].reverse())
+      }
+
+      if (lineChars.length > 0) allLines.push({ chars: lineChars, released: false, pins: [] })
+      x = 0; y += LINE_HEIGHT
     }
 
     const wt = 50
@@ -459,19 +529,74 @@ export default function App() {
   }, [text])
   doLayoutRef.current = doLayout
 
+  // Activate physics for all lines: make dynamic, add rope constraints, and pin each line in place
   const goPhysics = () => {
     if (physRef.current || !linesRef.current.length) return
     physRef.current = true; setPhysOn(true)
     const engine = getEngine()
     for (const line of linesRef.current) {
-      for (const { body } of line) Body.setStatic(body, false)
-      for (let i = 0; i < line.length - 1; i++) {
-        const pA = line[i].body.position, pB = line[i + 1].body.position
+      const { chars } = line
+      // calc average char width for max constraint length
+      const avgW = chars.length > 0 ? chars.reduce((s, c) => s + c.w, 0) / chars.length : 10
+      const maxLen = avgW * 2 // cap: soft-wrap joints use short rope, not actual distance
+      for (const { body } of chars) Body.setStatic(body, false)
+      // rope constraints between adjacent chars
+      for (let i = 0; i < chars.length - 1; i++) {
+        const pA = chars[i].body.position, pB = chars[i + 1].body.position
         const dist = Math.sqrt((pB.x - pA.x) ** 2 + (pB.y - pA.y) ** 2)
         Composite.add(engine.world, Constraint.create({
-          bodyA: line[i].body, bodyB: line[i + 1].body, length: dist, stiffness: 0.5, damping: 0.08,
+          bodyA: chars[i].body, bodyB: chars[i + 1].body,
+          length: Math.min(dist, maxLen), stiffness: 0.5, damping: 0.08,
         }))
       }
+      // pin every char so text stays perfectly in place until dragged off
+      const pins: Matter.Constraint[] = []
+      for (let i = 0; i < chars.length; i++) {
+        const b = chars[i].body
+        const pin = Constraint.create({
+          pointA: { x: b.position.x, y: b.position.y },
+          bodyB: b, pointB: { x: 0, y: 0 }, length: 0, stiffness: 0.4, damping: 0.1,
+        })
+        Composite.add(engine.world, pin)
+        pins.push(pin)
+      }
+      line.pins = pins; line.released = false
+    }
+  }
+
+  const PIN_BREAK_DIST = 12 // px — pins break when body moves this far from anchor
+
+  // Release only the pin attached to a specific body
+  const releasePinOnBody = (target: Matter.Body) => {
+    const engine = getEngine()
+    for (const line of linesRef.current) {
+      for (let i = line.pins.length - 1; i >= 0; i--) {
+        if (line.pins[i].bodyB === target) {
+          Composite.remove(engine.world, line.pins[i])
+          line.pins.splice(i, 1)
+          if (line.pins.length === 0) line.released = true
+          return
+        }
+      }
+    }
+  }
+
+  // Called every frame: break pins that are under too much tension (peeling effect)
+  const updatePins = () => {
+    const engine = getEngine()
+    for (const line of linesRef.current) {
+      if (line.released) continue
+      for (let i = line.pins.length - 1; i >= 0; i--) {
+        const pin = line.pins[i]
+        const b = pin.bodyB!
+        const a = pin.pointA!
+        const dist = Math.hypot(b.position.x - a.x, b.position.y - a.y)
+        if (dist > PIN_BREAK_DIST) {
+          Composite.remove(engine.world, pin)
+          line.pins.splice(i, 1)
+        }
+      }
+      if (line.pins.length === 0) line.released = true
     }
   }
 
@@ -498,8 +623,27 @@ export default function App() {
     if (!linesRef.current.length) return
     if (!physRef.current) goPhysics()
     let best: Matter.Body | null = null, bestD = 60
-    for (const line of linesRef.current) { for (const { body } of line) { const d = Math.hypot(body.position.x - mx, body.position.y - my); if (d < bestD) { bestD = d; best = body } } }
-    if (best) { const c = Constraint.create({ pointA: { x: mx, y: my }, bodyB: best, pointB: { x: 0, y: 0 }, length: 0.01, stiffness: 0.1, damping: 0.01 }); Composite.add(getEngine().world, c); dragRef.current = c }
+    for (const line of linesRef.current) { for (const { body } of line.chars) { const d = Math.hypot(body.position.x - mx, body.position.y - my); if (d < bestD) { bestD = d; best = body } } }
+    if (best) {
+      // release grabbed body's pin
+      releasePinOnBody(best)
+      // also release the nearest chain endpoint to create a free tail on the clicked side
+      for (const line of linesRef.current) {
+        const idx = line.chars.findIndex(c => c.body === best)
+        if (idx >= 0 && !line.released) {
+          if (idx < line.chars.length / 2) {
+            // clicked near start → free the start end
+            releasePinOnBody(line.chars[0].body)
+          } else {
+            // clicked near end → free the end
+            releasePinOnBody(line.chars[line.chars.length - 1].body)
+          }
+          break
+        }
+      }
+      const c = Constraint.create({ pointA: { x: mx, y: my }, bodyB: best, pointB: { x: 0, y: 0 }, length: 0.01, stiffness: 0.1, damping: 0.01 })
+      Composite.add(getEngine().world, c); dragRef.current = c
+    }
   }
 
   const exitFullscreen = () => {
