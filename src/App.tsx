@@ -1,6 +1,11 @@
 import { useRef, useState, useEffect, useCallback } from 'react'
 import Matter from 'matter-js'
+import { SoundFX } from './SoundFX'
+import { Recorder } from './Recorder'
 import './App.css'
+
+const sfx = new SoundFX()
+sfx.muted = true
 
 const { Engine, Composite, Bodies, Body, Constraint, Events } = Matter
 
@@ -14,11 +19,16 @@ const DEFAULT_TEXT =
   'Every string has two meanings\n\nThe one you type\nand the one that pulls'
 
 type ShapeKind = 'circle' | 'triangle' | 'square'
-type ToolMode = 'drag' | ShapeKind
+type ToolMode = 'drag' | ShapeKind | 'laser' | 'grenade'
 
 interface CB { ch: string; body: Matter.Body; w: number }
 interface RopeLine { chars: CB[]; released: boolean; pins: Matter.Constraint[] }
 interface PlacedShape { body: Matter.Body; kind: ShapeKind; size: number }
+
+interface LaserGun { x: number; y: number }
+// Laser bullet: travels with fixed speed, bounces off walls/shapes, has a short trail
+interface LaserBullet { x: number; y: number; dx: number; dy: number; trail: {x:number,y:number}[]; bounces: number; life: number; lastHitShape: number }
+interface Explosion { x:number; y:number; t:number; r:number }
 
 /* ── localStorage helpers ── */
 const LS_PREFIX = 'ss_'
@@ -39,8 +49,67 @@ function renderGlyph(ch: string, w: number): OffscreenCanvas {
   return oc
 }
 
+/* ── image → ASCII converter ── */
+async function imageToAscii(file: File, maxW = 90): Promise<string> {
+  const img = await createImageBitmap(file)
+  const charRatio = 0.48 // monospace chars are ~2x taller than wide
+  const tW = Math.min(maxW, img.width)
+  const tH = Math.round((img.height / img.width) * tW * charRatio)
+
+  const oc = new OffscreenCanvas(tW, tH)
+  const ctx = oc.getContext('2d')!
+  ctx.drawImage(img, 0, 0, tW, tH)
+  const { data } = ctx.getImageData(0, 0, tW, tH)
+
+  // grayscale
+  const grays: number[] = []
+  for (let i = 0; i < data.length; i += 4)
+    grays.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2])
+
+  // Otsu threshold for subject extraction
+  const hist = new Array(256).fill(0)
+  for (const g of grays) hist[Math.min(255, Math.round(g))]++
+  const total = grays.length
+  let sumAll = 0
+  for (let i = 0; i < 256; i++) sumAll += i * hist[i]
+  let bestThresh = 128, bestBetween = 0
+  let w0 = 0, sum0 = 0
+  for (let t = 0; t < 256; t++) {
+    w0 += hist[t]; if (w0 === 0) continue
+    const w1 = total - w0; if (w1 === 0) break
+    sum0 += t * hist[t]
+    const m0 = sum0 / w0, m1 = (sumAll - sum0) / w1
+    const between = w0 * w1 * (m0 - m1) ** 2
+    if (between > bestBetween) { bestBetween = between; bestThresh = t }
+  }
+
+  // 4-level mapping for cleaner ASCII
+  const lines: string[] = []
+  for (let y = 0; y < tH; y++) {
+    let line = ''
+    for (let x = 0; x < tW; x++) {
+      const g = grays[y * tW + x]
+      if (g < bestThresh * 0.5) line += '@'
+      else if (g < bestThresh * 0.8) line += '#'
+      else if (g < bestThresh) line += '*'
+      else line += ' '
+    }
+    lines.push(line.trimEnd())
+  }
+  // trim empty top/bottom lines
+  while (lines.length && !lines[0].trim()) lines.shift()
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop()
+  return lines.join('\n')
+}
+
+const LASER_SPEED = 800 // px/s
+const LASER_TRAIL = 18 // trail length in points
+const LASER_MAX_BOUNCES = 3
+const LASER_MAX_LIFE = 4 // seconds
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
   const [text, setText] = useState(DEFAULT_TEXT)
   const [fullscreen, setFullscreen] = useState(false)
   const [, setPhysOn] = useState(false)
@@ -49,11 +118,35 @@ export default function App() {
   const [showFps, setShowFps] = useState(() => loadLS('showFps', true))
   const [bounce, setBounce] = useState(() => loadLS('bounce', 0.9))
   const [floorH, setFloorH] = useState(() => loadLS('floorH', 10))
+  const [soundOn, setSoundOn] = useState(() => loadLS('soundOn', false))
+  const [soundVol, setSoundVol] = useState(() => loadLS('soundVol', 0.5))
+
+  const [isRec, setIsRec] = useState(false)
+  const [recBlob, setRecBlob] = useState<{ blob: Blob; mime: string; url: string } | null>(null)
+  const [mp4Progress, setMp4Progress] = useState('')
+  const recorderRef = useRef<Recorder | null>(null)
+  const recStartRef = useRef(0)
+
+  useEffect(() => { sfx.muted = !soundOn; sfx.volume = soundVol }, [soundOn, soundVol])
+
+  // resume AudioContext when tab regains focus (browser suspends it when hidden)
+  useEffect(() => {
+    const resume = () => { if (!document.hidden) sfx.resume() }
+    document.addEventListener('visibilitychange', resume)
+    window.addEventListener('focus', resume)
+    return () => { document.removeEventListener('visibilitychange', resume); window.removeEventListener('focus', resume) }
+  }, [])
 
   interface Ripple { x: number; amp: number; t: number }
 
   const engineRef = useRef<Matter.Engine | null>(null)
   const ripplesRef = useRef<Ripple[]>([])
+  const laserGunsRef = useRef<LaserGun[]>([])
+  const laserBulletsRef = useRef<LaserBullet[]>([])
+  const shapeHpRef = useRef<Map<Matter.Body, number>>(new Map())
+  const grenBodiesRef = useRef<{body: Matter.Body; fuse: number}[]>([])
+  const explosionsRef = useRef<Explosion[]>([])
+
   const getEngine = () => {
     if (!engineRef.current) {
       const eng = Engine.create({ gravity: { x: 0, y: 1.5, scale: 0.001 }, enableSleeping: true })
@@ -68,7 +161,8 @@ export default function App() {
           if (vy > 0.5) {
             const ripples = ripplesRef.current
             ripples.push({ x: other.position.x, amp: Math.min(vy * 3, 40), t: 0 })
-            if (ripples.length > 20) ripples.splice(0, ripples.length - 20) // cap
+            if (ripples.length > 20) ripples.splice(0, ripples.length - 20)
+            if (vy > 0.8) sfx.bounce()
           }
         }
       })
@@ -116,6 +210,161 @@ export default function App() {
     return -1
   }
 
+  /* ── fire all laser guns toward a target point ── */
+  const fireLasers = (tx: number, ty: number) => {
+    if (laserGunsRef.current.length > 0) sfx.laser()
+    for (const gun of laserGunsRef.current) {
+      const dx = tx - gun.x, dy = ty - gun.y
+      const len = Math.sqrt(dx * dx + dy * dy)
+      if (len < 1) continue
+      laserBulletsRef.current.push({
+        x: gun.x, y: gun.y, dx: dx / len, dy: dy / len,
+        trail: [{ x: gun.x, y: gun.y }], bounces: 0, life: 0, lastHitShape: -1,
+      })
+    }
+  }
+
+  // Per-frame laser bullet update: move, bounce, hit detect
+  const updateLasers = (dtSec: number) => {
+    const cw = canvasRef.current?.width ?? 0, ch = canvasRef.current?.height ?? 0
+    const fh = floorHRef.current, engine = getEngine()
+    const floorY = ch - fh
+    const bullets = laserBulletsRef.current
+    for (let bi = bullets.length - 1; bi >= 0; bi--) {
+      const b = bullets[bi]
+      b.life += dtSec
+      if (b.life > LASER_MAX_LIFE) { bullets.splice(bi, 1); continue }
+      const step = LASER_SPEED * dtSec
+      b.x += b.dx * step; b.y += b.dy * step
+      b.trail.push({ x: b.x, y: b.y })
+      if (b.trail.length > LASER_TRAIL) b.trail.shift()
+      // wall bounce
+      if ((b.x <= 0 || b.x >= cw) && b.bounces < LASER_MAX_BOUNCES) { b.dx = -b.dx; b.bounces++; b.x = Math.max(1, Math.min(cw - 1, b.x)); sfx.wallBounce() }
+      if ((b.y <= 0 || b.y >= floorY) && b.bounces < LASER_MAX_BOUNCES) { b.dy = -b.dy; b.bounces++; b.y = Math.max(1, Math.min(floorY - 1, b.y)); sfx.wallBounce() }
+      if (b.x < -50 || b.x > cw + 50 || b.y < -50 || b.y > ch + 50) { bullets.splice(bi, 1); continue }
+      // hit detect: proximity check
+      const hitR = 14
+      // text: push harder
+      for (const line of linesRef.current) {
+        for (const { body } of line.chars) {
+          if (Math.abs(body.position.x - b.x) < hitR && Math.abs(body.position.y - b.y) < hitR) {
+            releasePinOnBody(body)
+            Body.setVelocity(body, { x: b.dx * 8 + (Math.random() - 0.5) * 2, y: b.dy * 8 - 3 })
+            sfx.laserHit()
+          }
+        }
+      }
+      // shapes: reflect off shape + deal damage
+      for (let si = shapesRef.current.length - 1; si >= 0; si--) {
+        if (si === b.lastHitShape) continue // skip shape we just bounced off
+        const s = shapesRef.current[si]
+        const dist = Math.hypot(s.body.position.x - b.x, s.body.position.y - b.y)
+        if (dist < s.size / 2 + 10) {
+          // damage
+          const hp = (shapeHpRef.current.get(s.body) ?? 3) - 1
+          if (hp <= 0) {
+            Composite.remove(engine.world, s.body); shapeHpRef.current.delete(s.body)
+            shapesRef.current.splice(si, 1)
+            if (selectedRef.current === si) selectedRef.current = -1
+            else if (selectedRef.current > si) selectedRef.current--
+          } else {
+            shapeHpRef.current.set(s.body, hp)
+            // reflect off shape (shape bounces don't count toward wall bounce limit)
+            const nx = b.x - s.body.position.x, ny = b.y - s.body.position.y
+            const nl = Math.sqrt(nx * nx + ny * ny) || 1
+            const dot = b.dx * (nx / nl) + b.dy * (ny / nl)
+            b.dx -= 2 * dot * (nx / nl)
+            b.dy -= 2 * dot * (ny / nl)
+            // push outside shape
+            b.x = s.body.position.x + (nx / nl) * (s.size / 2 + 14)
+            b.y = s.body.position.y + (ny / nl) * (s.size / 2 + 14)
+            b.lastHitShape = si
+            sfx.pop()
+          }
+          break
+        }
+      }
+      // clear lastHitShape if bullet moved far from it
+      if (b.lastHitShape >= 0 && b.lastHitShape < shapesRef.current.length) {
+        const ls = shapesRef.current[b.lastHitShape]
+        if (Math.hypot(ls.body.position.x - b.x, ls.body.position.y - b.y) > ls.size / 2 + 20) b.lastHitShape = -1
+      } else { b.lastHitShape = -1 }
+    }
+  }
+
+  /* ── throw grenade: real physics body from screen edge ── */
+  const throwGrenade = (tx: number, ty: number) => {
+    const cw = canvasRef.current?.width ?? 0
+    // pick start from a random screen edge
+    const edge = Math.floor(Math.random() * 3)
+    let sx: number, sy: number
+    if (edge === 0) { sx = tx + (Math.random() - 0.5) * cw * 0.5; sy = -30 }
+    else if (edge === 1) { sx = -30; sy = ty + (Math.random() - 0.5) * 100 }
+    else { sx = cw + 30; sy = ty + (Math.random() - 0.5) * 100 }
+    const body = Bodies.circle(sx, sy, 8, {
+      restitution: 0.2, friction: 0.5, frictionAir: 0.005, density: 0.004,
+      label: 'grenade',
+    })
+    // calculate velocity to reach target in ~40 frames, compensating for gravity
+    // gravity per frame: g = 1.5 * 0.001 * 16.67 ≈ 0.025 per frame
+    // over T frames: y_offset from gravity = 0.5 * g * T^2
+    const T = 40 // target frames to arrive
+    const gPerFrame = 1.5 * 0.001 * 16.67
+    const vx = (tx - sx) / T
+    const vy = (ty - sy) / T - 0.5 * gPerFrame * T // compensate for gravity pulling down
+    Body.setVelocity(body, { x: vx, y: vy })
+    Composite.add(getEngine().world, body)
+    grenBodiesRef.current.push({ body, fuse: 0 })
+  }
+
+  /* ── grenade explosion ── */
+  const explodeAt = (gx: number, gy: number) => {
+    sfx.explosion()
+    const radius = 120
+    const engine = getEngine()
+    explosionsRef.current.push({ x: gx, y: gy, t: 0, r: radius })
+    // destroy shapes
+    for (let i = shapesRef.current.length - 1; i >= 0; i--) {
+      const s = shapesRef.current[i]
+      if (Math.hypot(s.body.position.x - gx, s.body.position.y - gy) < radius) {
+        Composite.remove(engine.world, s.body); shapeHpRef.current.delete(s.body)
+        shapesRef.current.splice(i, 1)
+        if (selectedRef.current === i) selectedRef.current = -1
+        else if (selectedRef.current > i) selectedRef.current--
+      }
+    }
+    // scatter text + break ropes
+    for (const line of linesRef.current) {
+      for (const { body } of line.chars) {
+        const d = Math.hypot(body.position.x - gx, body.position.y - gy)
+        if (d < radius) {
+          releasePinOnBody(body)
+          const a = Math.atan2(body.position.y - gy, body.position.x - gx)
+          const f = (1 - d / radius) * 0.06
+          Body.applyForce(body, body.position, { x: Math.cos(a) * f, y: Math.sin(a) * f - 0.02 })
+        }
+      }
+    }
+  }
+
+  // Per-frame grenade update: check collisions via speed drop (body hit something)
+  const updateGrenades = () => {
+    const engine = getEngine()
+    const grenades = grenBodiesRef.current
+    for (let gi = grenades.length - 1; gi >= 0; gi--) {
+      const g = grenades[gi]
+      g.fuse += 1
+      // explode if: body speed dropped sharply (hit something) after initial flight, or fuse > 300 frames (~5s)
+      const speed = Math.hypot(g.body.velocity.x, g.body.velocity.y)
+      const hitSomething = g.fuse > 15 && speed < 1.5
+      if (hitSomething || g.fuse > 300) {
+        explodeAt(g.body.position.x, g.body.position.y)
+        Composite.remove(engine.world, g.body)
+        grenades.splice(gi, 1)
+      }
+    }
+  }
+
   /* ═══════ render loop ═══════ */
   useEffect(() => {
     const engine = getEngine()
@@ -135,14 +384,24 @@ export default function App() {
         const ctx = canvas.getContext('2d')!
         const z = zoomRef.current, px = panRef.current.x, py = panRef.current.y
         const cw = canvas.width, ch = canvas.height
-        ctx.clearRect(0, 0, cw, ch)
+        const dtSec = dt / 1000
+        ctx.fillStyle = '#080808'
+        ctx.fillRect(0, 0, cw, ch)
 
         ctx.save(); ctx.translate(px, py); ctx.scale(z, z)
         const sel = selectedRef.current
 
+        // ── update systems ──
+        updateLasers(dtSec)
+        updateGrenades()
+        const explosions = explosionsRef.current
+        for (let ei = explosions.length - 1; ei >= 0; ei--) {
+          explosions[ei].t += dtSec
+          if (explosions[ei].t > 0.6) explosions.splice(ei, 1)
+        }
+
         // ── trampoline floor ──
         const ripples = ripplesRef.current
-        const dtSec = dt / 1000
         for (let ri = ripples.length - 1; ri >= 0; ri--) {
           ripples[ri].t += dtSec
           if (ripples[ri].amp * Math.exp(-ripples[ri].t * 2.5) < 0.15) ripples.splice(ri, 1)
@@ -203,12 +462,14 @@ export default function App() {
           }
         }
 
-        // shapes
+        // shapes (with HP-based opacity)
         for (let si = 0; si < shapesRef.current.length; si++) {
           const { body, kind, size } = shapesRef.current[si]
           const isSel = si === sel
-          ctx.fillStyle = isSel ? 'rgba(232,67,40,0.22)' : 'rgba(232,67,40,0.12)'
-          ctx.strokeStyle = isSel ? '#f04d32' : 'rgba(232,67,40,0.45)'
+          const hp = shapeHpRef.current.get(body) ?? 3
+          const hpAlpha = hp / 3
+          ctx.fillStyle = isSel ? `rgba(232,67,40,${0.22 * hpAlpha})` : `rgba(232,67,40,${0.12 * hpAlpha})`
+          ctx.strokeStyle = isSel ? `rgba(240,77,50,${hpAlpha})` : `rgba(232,67,40,${0.45 * hpAlpha})`
           ctx.lineWidth = (isSel ? 2.5 : 2) / z
           if (isSel) ctx.setLineDash([6 / z, 4 / z])
           if (kind === 'circle') {
@@ -280,6 +541,68 @@ export default function App() {
           }
         }
 
+        // laser gun visuals (red diamonds)
+        for (const gun of laserGunsRef.current) {
+          ctx.save()
+          ctx.translate(gun.x, gun.y)
+          ctx.rotate(Math.PI / 4)
+          ctx.fillStyle = 'rgba(255,40,40,0.7)'
+          ctx.strokeStyle = 'rgba(255,80,80,0.9)'
+          ctx.lineWidth = 2 / z
+          ctx.fillRect(-6 / z, -6 / z, 12 / z, 12 / z)
+          ctx.strokeRect(-6 / z, -6 / z, 12 / z, 12 / z)
+          ctx.restore()
+        }
+
+        // laser bullets (snake trails)
+        for (const b of laserBulletsRef.current) {
+          const tr = b.trail
+          if (tr.length < 2) continue
+          ctx.save()
+          ctx.lineCap = 'round'
+          for (let i = 1; i < tr.length; i++) {
+            const alpha = i / tr.length
+            ctx.strokeStyle = `rgba(255,40,40,${alpha * 0.9})`
+            ctx.lineWidth = (1 + alpha * 2.5) / z
+            ctx.beginPath(); ctx.moveTo(tr[i - 1].x, tr[i - 1].y); ctx.lineTo(tr[i].x, tr[i].y); ctx.stroke()
+          }
+          // glow at head
+          const head = tr[tr.length - 1]
+          ctx.fillStyle = 'rgba(255,80,60,0.5)'
+          ctx.beginPath(); ctx.arc(head.x, head.y, 4 / z, 0, Math.PI * 2); ctx.fill()
+          ctx.restore()
+        }
+
+        // flying grenades (real physics bodies)
+        for (const g of grenBodiesRef.current) {
+          const p = g.body.position
+          ctx.beginPath(); ctx.arc(p.x, p.y, 8, 0, Math.PI * 2)
+          ctx.fillStyle = 'rgba(60,60,60,0.9)'; ctx.fill()
+          ctx.strokeStyle = 'rgba(218,165,32,0.8)'; ctx.lineWidth = 2 / z; ctx.stroke()
+          // fuse spark
+          const spark = (g.fuse * 0.3) % 1
+          if (spark > 0.5) {
+            ctx.fillStyle = 'rgba(255,200,50,0.7)'
+            ctx.beginPath(); ctx.arc(p.x, p.y - 10, 3, 0, Math.PI * 2); ctx.fill()
+          }
+        }
+
+        // explosions
+        for (const ex of explosions) {
+          const progress = ex.t / 0.6
+          const alpha = Math.max(0, 1 - progress)
+          const currentR = ex.r * progress
+          if (currentR > 1) {
+            const grad = ctx.createRadialGradient(ex.x, ex.y, 0, ex.x, ex.y, currentR)
+            grad.addColorStop(0, `rgba(255,200,50,${alpha * 0.5})`)
+            grad.addColorStop(0.5, `rgba(255,80,20,${alpha * 0.3})`)
+            grad.addColorStop(1, 'rgba(255,30,10,0)')
+            ctx.fillStyle = grad; ctx.beginPath(); ctx.arc(ex.x, ex.y, currentR, 0, Math.PI * 2); ctx.fill()
+            ctx.strokeStyle = `rgba(255,180,50,${alpha * 0.7})`; ctx.lineWidth = 2 / z
+            ctx.beginPath(); ctx.arc(ex.x, ex.y, currentR, 0, Math.PI * 2); ctx.stroke()
+          }
+        }
+
         // fps body (in world space)
         const fpsBody = fpsBodyRef.current
         if (fpsBody && showFpsRef.current) {
@@ -340,11 +663,15 @@ export default function App() {
           let body: Matter.Body
           switch (sd.kind) {
             case 'circle': body = Bodies.circle(sd.x, sd.y, sd.size / 2, { isStatic: true }); break
-            case 'triangle': body = Bodies.polygon(sd.x, sd.y, 3, sd.size / 2, { isStatic: true }); break
+            case 'triangle':
+              body = Bodies.polygon(sd.x, sd.y, 3, sd.size / 2, { isStatic: true })
+              Body.setAngle(body, -Math.PI / 6)
+              break
             case 'square': body = Bodies.rectangle(sd.x, sd.y, sd.size, sd.size, { isStatic: true }); break
           }
           Composite.add(getEngine().world, body)
           shapesRef.current.push({ body, kind: sd.kind, size: sd.size })
+          shapeHpRef.current.set(body, 3)
           selectedRef.current = shapesRef.current.length - 1
           redoRef.current = []
         }
@@ -376,14 +703,17 @@ export default function App() {
         if (e.key === '1') { setTool('circle'); e.preventDefault(); return }
         if (e.key === '2') { setTool('triangle'); e.preventDefault(); return }
         if (e.key === '3') { setTool('square'); e.preventDefault(); return }
+        if (e.key === '4') { setTool('laser'); e.preventDefault(); return }
+        if (e.key === '5') { setTool('grenade'); e.preventDefault(); return }
         if (e.key === 'r' || e.key === 'R') { doLayoutRef.current(); e.preventDefault(); return }
+        if (e.key === 's' || e.key === 'S') { shatterAll(); e.preventDefault(); return }
         if (e.key === '=' || e.key === '+') { applyZoom(1.15, window.innerWidth / 2, window.innerHeight / 2); e.preventDefault(); return }
         if (e.key === '-') { applyZoom(0.87, window.innerWidth / 2, window.innerHeight / 2); e.preventDefault(); return }
         if (e.key === '0') { zoomRef.current = 1; panRef.current = { x: 0, y: 0 }; e.preventDefault(); return }
       }
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedRef.current >= 0) {
         const s = shapesRef.current[selectedRef.current]
-        if (s) { Composite.remove(getEngine().world, s.body); shapesRef.current.splice(selectedRef.current, 1) }
+        if (s) { Composite.remove(getEngine().world, s.body); shapeHpRef.current.delete(s.body); shapesRef.current.splice(selectedRef.current, 1) }
         selectedRef.current = -1; e.preventDefault(); return
       }
       if (meta && e.key === 'z' && !e.shiftKey) { undoShape(); e.preventDefault(); return }
@@ -432,11 +762,18 @@ export default function App() {
     panRef.current.y = cy - (cy - panRef.current.y) * (newZ / oldZ)
     zoomRef.current = newZ
   }
-  const onWheel = (e: React.WheelEvent) => {
-    e.preventDefault()
-    const sp = canvasPos(e.clientX, e.clientY)
-    applyZoom(e.deltaY > 0 ? 0.93 : 1.08, sp.x, sp.y)
-  }
+  // wheel zoom — must be non-passive native listener to allow preventDefault
+  useEffect(() => {
+    const canvas = canvasRef.current; if (!canvas) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const sp = canvasPos(e.clientX, e.clientY)
+      applyZoom(e.deltaY > 0 ? 0.93 : 1.08, sp.x, sp.y)
+    }
+    canvas.addEventListener('wheel', onWheel, { passive: false })
+    return () => canvas.removeEventListener('wheel', onWheel)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const doLayoutRef = useRef(() => {})
 
@@ -449,6 +786,9 @@ export default function App() {
     for (const s of shapesRef.current) Composite.add(engine.world, s.body)
     dragRef.current = null; physRef.current = false; selectedRef.current = -1
     glyphCache.current.clear()
+    laserGunsRef.current = []; laserBulletsRef.current = []
+    for (const g of grenBodiesRef.current) Composite.remove(getEngine().world, g.body)
+    grenBodiesRef.current = []; explosionsRef.current = []; shapeHpRef.current.clear()
 
     const w = window.innerWidth, h = window.innerHeight
     canvas.width = w; canvas.height = h
@@ -567,6 +907,7 @@ export default function App() {
   const PIN_BREAK_DIST = 12 // px — pins break when body moves this far from anchor
 
   // Release only the pin attached to a specific body
+  let lastPopT = 0 // throttle pop sounds
   const releasePinOnBody = (target: Matter.Body) => {
     const engine = getEngine()
     for (const line of linesRef.current) {
@@ -575,6 +916,8 @@ export default function App() {
           Composite.remove(engine.world, line.pins[i])
           line.pins.splice(i, 1)
           if (line.pins.length === 0) line.released = true
+          const now = performance.now()
+          if (now - lastPopT > 60) { sfx.pop(); lastPopT = now } // throttled
           return
         }
       }
@@ -600,22 +943,57 @@ export default function App() {
     }
   }
 
+  // release all pins + apply random explosion force
+  const shatterAll = () => {
+    sfx.shatter()
+    if (!physRef.current) goPhysics()
+    const engine = getEngine()
+    for (const line of linesRef.current) {
+      for (const pin of line.pins) Composite.remove(engine.world, pin)
+      line.pins = []; line.released = true
+      for (const { body } of line.chars) {
+        Body.setVelocity(body, {
+          x: (Math.random() - 0.5) * 12,
+          y: -(Math.random() * 8 + 2),
+        })
+        Body.setAngularVelocity(body, (Math.random() - 0.5) * 0.3)
+      }
+    }
+  }
+
   const undoShape = () => {
     const last = shapesRef.current.pop()
-    if (last) { Composite.remove(getEngine().world, last.body); redoRef.current.push(last) }
+    if (last) { Composite.remove(getEngine().world, last.body); shapeHpRef.current.delete(last.body); redoRef.current.push(last) }
     selectedRef.current = -1
   }
   const redoShape = () => {
     const shape = redoRef.current.pop()
-    if (shape) { Composite.add(getEngine().world, shape.body); shapesRef.current.push(shape); selectedRef.current = shapesRef.current.length - 1 }
+    if (shape) { Composite.add(getEngine().world, shape.body); shapesRef.current.push(shape); shapeHpRef.current.set(shape.body, 3); selectedRef.current = shapesRef.current.length - 1 }
   }
 
   const onDown = (e: React.MouseEvent | React.TouchEvent) => {
+    sfx.ensure() // keep AudioContext alive on every user gesture
     if ('button' in e && e.button === 2) { isPanRef.current = true; lastPanRef.current = { x: e.clientX, y: e.clientY }; e.preventDefault(); return }
     e.preventDefault()
     const cx = 'touches' in e ? e.touches[0].clientX : e.clientX
     const cy = 'touches' in e ? e.touches[0].clientY : e.clientY
     const sp = canvasPos(cx, cy); const { x: mx, y: my } = screenToWorld(sp.x, sp.y)
+
+    // laser tool: place gun
+    if (tool === 'laser') {
+      const guns = laserGunsRef.current
+      guns.push({ x: mx, y: my })
+      if (guns.length > 5) guns.shift()
+      return
+    }
+
+    // grenade tool: throw grenade
+    if (tool === 'grenade') {
+      if (!physRef.current && linesRef.current.length) goPhysics()
+      throwGrenade(mx, my)
+      return
+    }
+
     if (tool !== 'drag') { shapeDrawRef.current = { kind: tool, x: mx, y: my, size: 0 }; return }
     const si = findShapeAt(mx, my)
     if (si >= 0) { selectedRef.current = si; const s = shapesRef.current[si]; shapeDragRef.current = { idx: si, ox: mx - s.body.position.x, oy: my - s.body.position.y }; return }
@@ -643,6 +1021,9 @@ export default function App() {
       }
       const c = Constraint.create({ pointA: { x: mx, y: my }, bodyB: best, pointB: { x: 0, y: 0 }, length: 0.01, stiffness: 0.1, damping: 0.01 })
       Composite.add(getEngine().world, c); dragRef.current = c
+    } else if (laserGunsRef.current.length > 0) {
+      // clicked empty space in drag mode with guns placed → fire lasers
+      fireLasers(mx, my)
     }
   }
 
@@ -651,6 +1032,9 @@ export default function App() {
     physRef.current = false; selectedRef.current = -1
     linesRef.current = []; shapesRef.current = []; redoRef.current = []; wallsRef.current = []
     fpsBodyRef.current = null; ripplesRef.current = []
+    laserGunsRef.current = []; laserBulletsRef.current = []
+    for (const g of grenBodiesRef.current) Composite.remove(getEngine().world, g.body)
+    grenBodiesRef.current = []; explosionsRef.current = []; shapeHpRef.current.clear()
     Composite.clear(getEngine().world, false); glyphCache.current.clear()
     dragRef.current = null; shapeDragRef.current = null; shapeDrawRef.current = null
     zoomRef.current = 1; panRef.current = { x: 0, y: 0 }; document.body.style.overflow = ''
@@ -701,12 +1085,56 @@ export default function App() {
     circle: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="9"/></svg>,
     tri: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round"><path d="M12 3L2 21h20L12 3z"/></svg>,
     sq: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="4" y="4" width="16" height="16" rx="1"/></svg>,
+    laser: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/></svg>,
+    grenade: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="14" r="8"/><path d="M12 6V3"/><path d="M9 3h6"/><path d="M15 6c1-1 2-2 3-2"/></svg>,
     undo: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>,
     redo: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.13-9.36L23 10"/></svg>,
     reset: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21.5 2v6h-6"/><path d="M2.5 22v-6h6"/><path d="M2 11.5a10 10 0 0 1 18.8-4.3L21.5 8"/><path d="M22 12.5a10 10 0 0 1-18.8 4.2L2.5 16"/></svg>,
     zoomReset: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/><path d="M8 11h6M11 8v6"/></svg>,
     settings: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>,
+    shatter: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>,
+    rec: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="6" fill="currentColor"/></svg>,
     close: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>,
+  }
+
+  const toggleRec = () => {
+    if (isRec) {
+      recorderRef.current?.stop()
+      setIsRec(false)
+    } else {
+      const canvas = canvasRef.current; if (!canvas) return
+      sfx.ensure()
+      const rec = new Recorder(canvas, soundOn)
+      rec.onStop = (blob, mime) => setRecBlob({ blob, mime, url: URL.createObjectURL(blob) })
+      rec.start()
+      recorderRef.current = rec
+      recStartRef.current = performance.now()
+      setIsRec(true)
+    }
+  }
+
+  const downloadWebm = () => {
+    if (!recBlob) return
+    const url = URL.createObjectURL(recBlob.blob)
+    const a = document.createElement('a'); a.href = url
+    a.download = `string-string-${Date.now()}.webm`; a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const convertMp4 = async () => {
+    if (!recBlob) return
+    setMp4Progress('Loading FFmpeg...')
+    try {
+      const mp4 = await Recorder.convertToMp4(recBlob.blob, pct => setMp4Progress(`${pct}%`))
+      const url = URL.createObjectURL(mp4)
+      const a = document.createElement('a'); a.href = url
+      a.download = `string-string-${Date.now()}.mp4`; a.click()
+      URL.revokeObjectURL(url)
+      setMp4Progress('Done!')
+    } catch (err) {
+      console.error(err)
+      setMp4Progress('Failed')
+    }
   }
 
   return (
@@ -721,13 +1149,20 @@ export default function App() {
             <textarea value={text} onChange={e => setText(e.target.value)} rows={6} spellCheck={false} placeholder="Each line becomes a separate string." />
             <div className="actions">
               <button className="btn primary" onClick={doLayout}>Render</button>
+              <button className="btn ghost" onClick={() => fileRef.current?.click()}>Image → ASCII</button>
+              <input ref={fileRef} type="file" accept="image/*" hidden onChange={async e => {
+                const f = e.target.files?.[0]; if (!f) return
+                const ascii = await imageToAscii(f)
+                setText(ascii)
+                e.target.value = '' // reset so same file can be re-selected
+              }} />
             </div>
           </section>
         </>
       )}
 
       <section className={`canvas-section${fullscreen ? ' fullscreen' : ''}`}>
-        <canvas ref={canvasRef} onMouseDown={onDown} onTouchStart={onDown} onWheel={onWheel} onContextMenu={e => e.preventDefault()} />
+        <canvas ref={canvasRef} onMouseDown={onDown} onTouchStart={onDown} onContextMenu={e => e.preventDefault()} />
       </section>
 
       {fullscreen && (
@@ -738,13 +1173,17 @@ export default function App() {
             <button className={`tool-btn${tool === 'circle' ? ' active' : ''}`} onClick={() => setTool('circle')} title="Circle (1)">{I.circle}<kbd>1</kbd></button>
             <button className={`tool-btn${tool === 'triangle' ? ' active' : ''}`} onClick={() => setTool('triangle')} title="Triangle (2)">{I.tri}<kbd>2</kbd></button>
             <button className={`tool-btn${tool === 'square' ? ' active' : ''}`} onClick={() => setTool('square')} title="Square (3)">{I.sq}<kbd>3</kbd></button>
+            <button className={`tool-btn${tool === 'laser' ? ' active' : ''}`} onClick={() => setTool('laser')} title="Laser (4)">{I.laser}<kbd>4</kbd></button>
+            <button className={`tool-btn${tool === 'grenade' ? ' active' : ''}`} onClick={() => setTool('grenade')} title="Grenade (5)">{I.grenade}<kbd>5</kbd></button>
             <div className="tool-sep" />
             <button className="tool-btn" onClick={undoShape} title="Undo (Ctrl+Z)">{I.undo}<kbd>Z</kbd></button>
             <button className="tool-btn" onClick={redoShape} title="Redo (Ctrl+Shift+Z)">{I.redo}<kbd>Y</kbd></button>
+            <button className="tool-btn" onClick={shatterAll} title="Shatter all (S)">{I.shatter}<kbd>S</kbd></button>
             <div className="tool-sep" />
             <button className="tool-btn" onClick={() => { setPhysOn(false); doLayout() }} title="Reset (R)">{I.reset}<kbd>R</kbd></button>
             <button className="tool-btn" onClick={() => { zoomRef.current = 1; panRef.current = { x: 0, y: 0 } }} title="Fit (0)">{I.zoomReset}<kbd>0</kbd></button>
             <button className={`tool-btn${showPanel ? ' active' : ''}`} onClick={() => setShowPanel(v => !v)} title="Settings">{I.settings}</button>
+            <button className={`tool-btn${isRec ? ' recording' : ''}`} onClick={toggleRec} title={isRec ? 'Stop recording' : 'Record'}>{I.rec}</button>
             <button className="tool-btn exit-btn" onClick={exitFullscreen} title="Back">{I.close}</button>
           </div>
 
@@ -764,6 +1203,36 @@ export default function App() {
                 <span>FPS</span>
                 <input type="checkbox" checked={showFps} onChange={e => toggleFps(e.target.checked)} />
               </label>
+              <div className="tool-sep" style={{height: 'auto', margin: '0 8px'}} />
+              <label>
+                <span>Sound</span>
+                <input type="checkbox" checked={soundOn} onChange={e => {
+                  const on = e.target.checked; setSoundOn(on); saveLS('soundOn', on)
+                  if (on) sfx.click() // init AudioContext during user gesture
+                }} />
+              </label>
+              {soundOn && (
+                <label>
+                  <span>Vol</span>
+                  <input type="range" min="0" max="1" step="0.05" value={soundVol} onChange={e => { setSoundVol(+e.target.value); saveLS('soundVol', +e.target.value) }} />
+                  <span className="val">{Math.round(soundVol * 100)}%</span>
+                </label>
+              )}
+            </div>
+          )}
+
+          {recBlob && (
+            <div className="rec-modal" onClick={e => {
+              if (e.target === e.currentTarget) { URL.revokeObjectURL(recBlob.url); setRecBlob(null); setMp4Progress('') }
+            }}>
+              <div className="rec-modal-inner">
+                <video src={recBlob.url} controls autoPlay style={{ width: '100%', borderRadius: 8 }} />
+                <div className="rec-modal-actions">
+                  <button className="btn primary" onClick={downloadWebm}>Download WebM</button>
+                  <button className="btn ghost" onClick={convertMp4}>{mp4Progress || 'Convert to MP4'}</button>
+                  <button className="btn ghost" onClick={() => { URL.revokeObjectURL(recBlob.url); setRecBlob(null); setMp4Progress('') }}>Close</button>
+                </div>
+              </div>
             </div>
           )}
         </>
