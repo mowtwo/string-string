@@ -761,6 +761,14 @@ export default function App() {
         if (k === 'd' || k === 'arrowright') { f.keys.right = true; e.preventDefault() }
         if (k === 'j') { f.keys.fire = true; e.preventDefault() }
         if (k === ' ') { f.keys.ultimate = true; e.preventDefault() }
+        // cheat code: ↑↓←→BABA
+        const cheatKey = k === 'arrowup' ? 'up' : k === 'arrowdown' ? 'down' : k === 'arrowleft' ? 'left' : k === 'arrowright' ? 'right' : k
+        f.cheatBuffer.push(cheatKey)
+        if (f.cheatBuffer.length > 8) f.cheatBuffer.shift()
+        if (f.cheatBuffer.length === 8 && f.cheatBuffer.join(',') === 'up,down,left,right,b,a,b,a') {
+          f.godMode = true; f.energy = 3; f.lives = 999
+          f.cheatBuffer = []; sfx.shatter()
+        }
         return
       }
       const meta = e.metaKey || e.ctrlKey

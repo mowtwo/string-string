@@ -35,6 +35,7 @@ const ENERGY_CHARGE_TIME = 60000 // 60s per bar
 const MAX_ENERGY = 3
 const ULTIMATE_RADIUS_RATIO = 0.33 // 1/3 of screen diagonal
 const POWERUP_SPAWN_INTERVAL = 8000
+// cheat code checked in App.tsx keyboard handler: ↑↓←→BABA
 
 interface Powerup { x: number; y: number; kind: 'heal' | 'shield'; spawnTime: number }
 
@@ -64,6 +65,8 @@ export interface FighterState {
   lastFireTime: number
   joyAngle: number; joyMag: number
   startTime: number
+  cheatBuffer: string[]
+  godMode: boolean
 }
 
 export function createFighterState(): FighterState {
@@ -92,6 +95,7 @@ export function createFighterState(): FighterState {
     joyAngle: 0, joyMag: 0,
     startTime: 0,
     shieldUntil: 0, energy: 0.5,
+    cheatBuffer: [], godMode: false,
   }
 }
 
@@ -223,11 +227,11 @@ export function updateFighter(
   state.y = Math.max(20, state.y)
 
   // ── energy charge: 1 bar per 60s ──
-  state.energy = Math.min(MAX_ENERGY, 0.5 + (now - state.startTime) / ENERGY_CHARGE_TIME)
+  state.energy = Math.min(MAX_ENERGY, state.energy + 0.016 / (ENERGY_CHARGE_TIME / 1000))
 
   // ── ultimate (space) ──
   if (keys.ultimate && state.energy >= 1) {
-    state.energy = Math.floor(state.energy) - 1 + (state.energy % 1) // consume 1 bar
+    if (!state.godMode) state.energy -= 1 // consume 1 bar (god mode: infinite)
     const radius = Math.sqrt(cw * cw + ch * ch) * ULTIMATE_RADIUS_RATIO
     state.explosions.push({ x: state.x, y: state.y, t: 0, r: radius })
     sfx.shatter()
@@ -442,7 +446,7 @@ export function updateFighter(
 
   // ── helper: damage ship with knockback ──
   const damageShip = (fromX: number, fromY: number, force: number) => {
-    if (now < state.invincibleUntil) return
+    if (state.godMode || now < state.invincibleUntil) return
     // shield absorbs one hit
     if (now < state.shieldUntil) {
       state.shieldUntil = 0 // shield consumed
@@ -839,7 +843,7 @@ export function drawFighterHUD(
   // Lives
   ctx.fillStyle = 'rgba(255,100,100,0.8)'; ctx.font = '14px "DM Mono", monospace'
   ctx.textAlign = 'left'
-  ctx.fillText('♥'.repeat(state.lives) + '♡'.repeat(MAX_LIVES - state.lives), 12, topY)
+  ctx.fillText(state.godMode ? '♥ x999' : '♥'.repeat(state.lives) + '♡'.repeat(MAX_LIVES - state.lives), 12, topY)
 
   // Shield indicator
   if (now < state.shieldUntil) {
