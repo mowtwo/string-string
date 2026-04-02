@@ -13,6 +13,8 @@ const FONT_SIZE = 15
 const LINE_HEIGHT = 24
 const PAD = 28
 const FONT = `${FONT_SIZE}px "DM Mono", monospace`
+const DPR = Math.min(window.devicePixelRatio || 1, 2) // cap at 2x to limit perf cost
+const IS_MOBILE = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent)
 const MAX_CHARS_PER_LINE = 500
 const MIN_LAYOUT_W = 320 // minimum text layout width
 const DEFAULT_TEXT =
@@ -42,8 +44,9 @@ const saveLS = (key: string, val: unknown) => {
 /* ── pre-render a character glyph to an offscreen bitmap ── */
 function renderGlyph(ch: string, w: number): OffscreenCanvas {
   const h = FONT_SIZE + 8
-  const oc = new OffscreenCanvas(Math.ceil(w) + 4, h)
+  const oc = new OffscreenCanvas((Math.ceil(w) + 4) * DPR, h * DPR)
   const octx = oc.getContext('2d')!
+  octx.scale(DPR, DPR)
   octx.font = FONT; octx.fillStyle = '#f0e6d3'; octx.textBaseline = 'middle'
   octx.fillText(ch, 2, h / 2)
   return oc
@@ -115,6 +118,7 @@ export default function App() {
   const [, setPhysOn] = useState(false)
   const [tool, setTool] = useState<ToolMode>('drag')
   const [showPanel, setShowPanel] = useState(false)
+  const [mobileMenu, setMobileMenu] = useState(false)
   const [showFps, setShowFps] = useState(() => loadLS('showFps', true))
   const [bounce, setBounce] = useState(() => loadLS('bounce', 0.9))
   const [floorH, setFloorH] = useState(() => loadLS('floorH', 10))
@@ -193,6 +197,7 @@ export default function App() {
   // fps tracking
   const fpsRef = useRef({ frames: 0, last: 0, value: 0 })
   const fpsBodyRef = useRef<Matter.Body | null>(null)
+  const mobileUIBodiesRef = useRef<Matter.Body[]>([])
 
   const canvasPos = (cx: number, cy: number) => {
     const r = canvasRef.current?.getBoundingClientRect()
@@ -289,6 +294,25 @@ export default function App() {
         const ls = shapesRef.current[b.lastHitShape]
         if (Math.hypot(ls.body.position.x - b.x, ls.body.position.y - b.y) > ls.size / 2 + 20) b.lastHitShape = -1
       } else { b.lastHitShape = -1 }
+
+      // reflect off static UI bodies (mobile sidebars, topbar) and FPS body
+      const staticBodies: Matter.Body[] = [...mobileUIBodiesRef.current]
+      if (fpsBodyRef.current) staticBodies.push(fpsBodyRef.current)
+      for (const sb of staticBodies) {
+        const hw = (sb.bounds.max.x - sb.bounds.min.x) / 2 + 6
+        const hh = (sb.bounds.max.y - sb.bounds.min.y) / 2 + 6
+        if (Math.abs(b.x - sb.position.x) < hw && Math.abs(b.y - sb.position.y) < hh) {
+          // reflect using approximate normal from center
+          const nx = b.x - sb.position.x, ny = b.y - sb.position.y
+          const nl = Math.sqrt(nx * nx + ny * ny) || 1
+          const dot = b.dx * (nx / nl) + b.dy * (ny / nl)
+          b.dx -= 2 * dot * (nx / nl); b.dy -= 2 * dot * (ny / nl)
+          b.x = sb.position.x + (nx / nl) * (hw + 4)
+          b.y = sb.position.y + (ny / nl) * (hh + 4)
+          sfx.wallBounce()
+          break
+        }
+      }
     }
   }
 
@@ -298,9 +322,10 @@ export default function App() {
     // pick start from a random screen edge
     const edge = Math.floor(Math.random() * 3)
     let sx: number, sy: number
-    if (edge === 0) { sx = tx + (Math.random() - 0.5) * cw * 0.5; sy = -30 }
-    else if (edge === 1) { sx = -30; sy = ty + (Math.random() - 0.5) * 100 }
-    else { sx = cw + 30; sy = ty + (Math.random() - 0.5) * 100 }
+    const topSafe = IS_MOBILE ? 60 : 10 // avoid mobile top bar collision body
+    if (edge === 0) { sx = tx + (Math.random() - 0.5) * cw * 0.5; sy = topSafe }
+    else if (edge === 1) { sx = -20; sy = Math.max(topSafe, ty + (Math.random() - 0.5) * 100) }
+    else { sx = cw + 20; sy = Math.max(topSafe, ty + (Math.random() - 0.5) * 100) }
     const body = Bodies.circle(sx, sy, 8, {
       restitution: 0.2, friction: 0.5, frictionAir: 0.005, density: 0.004,
       label: 'grenade',
@@ -383,8 +408,11 @@ export default function App() {
       if (canvas && canvas.width > 0) {
         const ctx = canvas.getContext('2d')!
         const z = zoomRef.current, px = panRef.current.x, py = panRef.current.y
-        const cw = canvas.width, ch = canvas.height
+        // logical size (CSS pixels) — all world coords use this
+        const cw = canvas.width / DPR, ch = canvas.height / DPR
         const dtSec = dt / 1000
+        ctx.save()
+        ctx.scale(DPR, DPR) // HiDPI: scale drawing to match physical pixels
         ctx.fillStyle = '#080808'
         ctx.fillRect(0, 0, cw, ch)
 
@@ -536,7 +564,7 @@ export default function App() {
             ctx.save()
             ctx.translate(body.position.x, body.position.y)
             ctx.rotate(body.angle)
-            ctx.drawImage(glyph, -w / 2 - 2, -(FONT_SIZE + 8) / 2)
+            ctx.drawImage(glyph, -w / 2 - 2, -(FONT_SIZE + 8) / 2, glyph.width / DPR, glyph.height / DPR)
             ctx.restore()
           }
         }
@@ -634,6 +662,7 @@ export default function App() {
           ctx.fillText(`${Math.round(z * 100)}%`, cw - 16, ch - 16)
           ctx.textAlign = 'left'
         }
+        ctx.restore() // close DPR scale
       }
       raf = requestAnimationFrame(loop)
     }
@@ -730,7 +759,8 @@ export default function App() {
       if (!fullscreenRef.current) return
       const canvas = canvasRef.current; if (!canvas) return
       const w = window.innerWidth, h = window.innerHeight
-      canvas.width = w; canvas.height = h
+      canvas.width = w * DPR; canvas.height = h * DPR
+      canvas.style.width = w + 'px'; canvas.style.height = h + 'px'
       // reposition walls
       const walls = wallsRef.current
       if (walls.length >= 3) {
@@ -740,6 +770,7 @@ export default function App() {
         Body.setPosition(walls[2], { x: w + 25, y: h / 2 })
       }
       if (fpsBodyRef.current) Body.setPosition(fpsBodyRef.current, { x: w - 60, y: 70 })
+      repositionMobileUIBodies()
       // rescue out-of-bounds bodies → teleport to top and re-drop
       const margin = 80
       for (const line of linesRef.current) {
@@ -791,7 +822,8 @@ export default function App() {
     grenBodiesRef.current = []; explosionsRef.current = []; shapeHpRef.current.clear()
 
     const w = window.innerWidth, h = window.innerHeight
-    canvas.width = w; canvas.height = h
+    canvas.width = w * DPR; canvas.height = h * DPR
+    canvas.style.width = w + 'px'; canvas.style.height = h + 'px'
     const ctx = canvas.getContext('2d')!; ctx.font = FONT
     const layoutW = Math.max(MIN_LAYOUT_W, w - PAD * 2)
     const allLines: RopeLine[] = []
@@ -865,6 +897,7 @@ export default function App() {
     // spawn fps body if fps enabled
     fpsBodyRef.current = null
     if (showFpsRef.current) spawnFpsBody()
+    removeMobileUIBodies(); spawnMobileUIBodies()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text])
   doLayoutRef.current = doLayout
@@ -1031,7 +1064,7 @@ export default function App() {
     setFullscreen(false); fullscreenRef.current = false; setPhysOn(false); setTool('drag')
     physRef.current = false; selectedRef.current = -1
     linesRef.current = []; shapesRef.current = []; redoRef.current = []; wallsRef.current = []
-    fpsBodyRef.current = null; ripplesRef.current = []
+    fpsBodyRef.current = null; mobileUIBodiesRef.current = []; ripplesRef.current = []
     laserGunsRef.current = []; laserBulletsRef.current = []
     for (const g of grenBodiesRef.current) Composite.remove(getEngine().world, g.body)
     grenBodiesRef.current = []; explosionsRef.current = []; shapeHpRef.current.clear()
@@ -1041,6 +1074,36 @@ export default function App() {
   }
 
   // FPS body: static collider at top-right, text bounces off it
+  const spawnMobileUIBodies = () => {
+    if (!IS_MOBILE || mobileUIBodiesRef.current.length > 0) return
+    const w = window.innerWidth, h = window.innerHeight
+    const engine = getEngine()
+    const r = bounceRef.current
+    const bodies = [
+      // top bar: full width, 48px
+      Bodies.rectangle(w / 2, 24, w, 48, { isStatic: true, restitution: r, label: 'ui' }),
+      // left sidebar: ~48px wide, ~180px tall
+      Bodies.rectangle(28, h / 2, 50, 190, { isStatic: true, restitution: r, label: 'ui' }),
+      // right sidebar: ~48px wide, ~190px tall
+      Bodies.rectangle(w - 28, h / 2, 50, 200, { isStatic: true, restitution: r, label: 'ui' }),
+    ]
+    for (const b of bodies) Composite.add(engine.world, b)
+    mobileUIBodiesRef.current = bodies
+  }
+  const removeMobileUIBodies = () => {
+    const engine = getEngine()
+    for (const b of mobileUIBodiesRef.current) Composite.remove(engine.world, b)
+    mobileUIBodiesRef.current = []
+  }
+  const repositionMobileUIBodies = () => {
+    const bodies = mobileUIBodiesRef.current
+    if (bodies.length < 3) return
+    const w = window.innerWidth, h = window.innerHeight
+    Body.setPosition(bodies[0], { x: w / 2, y: 24 })
+    Body.setPosition(bodies[1], { x: 28, y: h / 2 })
+    Body.setPosition(bodies[2], { x: w - 28, y: h / 2 })
+  }
+
   const spawnFpsBody = () => {
     if (fpsBodyRef.current) return
     const body = Bodies.rectangle(window.innerWidth - 60, 70, 68, 24, {
@@ -1093,6 +1156,7 @@ export default function App() {
     zoomReset: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/><path d="M8 11h6M11 8v6"/></svg>,
     settings: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>,
     shatter: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>,
+    menu: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M3 12h18M3 6h18M3 18h18"/></svg>,
     rec: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="6" fill="currentColor"/></svg>,
     close: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>,
   }
@@ -1167,7 +1231,8 @@ export default function App() {
 
       {fullscreen && (
         <>
-          <div className="toolbar">
+          {/* ── Desktop toolbar ── */}
+          {!IS_MOBILE && <div className="toolbar desktop-only">
             <button className={`tool-btn${tool === 'drag' ? ' active' : ''}`} onClick={() => setTool('drag')} title="Drag (Esc)">{I.hand}<kbd>Esc</kbd></button>
             <div className="tool-sep" />
             <button className={`tool-btn${tool === 'circle' ? ' active' : ''}`} onClick={() => setTool('circle')} title="Circle (1)">{I.circle}<kbd>1</kbd></button>
@@ -1185,41 +1250,67 @@ export default function App() {
             <button className={`tool-btn${showPanel ? ' active' : ''}`} onClick={() => setShowPanel(v => !v)} title="Settings">{I.settings}</button>
             <button className={`tool-btn${isRec ? ' recording' : ''}`} onClick={toggleRec} title={isRec ? 'Stop recording' : 'Record'}>{I.rec}</button>
             <button className="tool-btn exit-btn" onClick={exitFullscreen} title="Back">{I.close}</button>
-          </div>
+          </div>}
 
-          {showPanel && (
+          {/* ── Desktop settings panel ── */}
+          {!IS_MOBILE && showPanel && (
             <div className="settings-panel">
-              <label>
-                <span>Bounce</span>
-                <input type="range" min="0" max="2" step="0.05" value={bounce} onChange={e => handleBounceChange(+e.target.value)} />
-                <span className="val">{bounce.toFixed(2)}</span>
-              </label>
-              <label>
-                <span>Floor</span>
-                <input type="range" min="1" max="50" step="1" value={floorH} onChange={e => handleFloorHChange(+e.target.value)} />
-                <span className="val">{floorH}px</span>
-              </label>
-              <label>
-                <span>FPS</span>
-                <input type="checkbox" checked={showFps} onChange={e => toggleFps(e.target.checked)} />
-              </label>
+              <label><span>Bounce</span><input type="range" min="0" max="2" step="0.05" value={bounce} onChange={e => handleBounceChange(+e.target.value)} /><span className="val">{bounce.toFixed(2)}</span></label>
+              <label><span>Floor</span><input type="range" min="1" max="50" step="1" value={floorH} onChange={e => handleFloorHChange(+e.target.value)} /><span className="val">{floorH}px</span></label>
+              <label><span>FPS</span><input type="checkbox" checked={showFps} onChange={e => toggleFps(e.target.checked)} /></label>
               <div className="tool-sep" style={{height: 'auto', margin: '0 8px'}} />
-              <label>
-                <span>Sound</span>
-                <input type="checkbox" checked={soundOn} onChange={e => {
-                  const on = e.target.checked; setSoundOn(on); saveLS('soundOn', on)
-                  if (on) sfx.click() // init AudioContext during user gesture
-                }} />
-              </label>
-              {soundOn && (
-                <label>
-                  <span>Vol</span>
-                  <input type="range" min="0" max="1" step="0.05" value={soundVol} onChange={e => { setSoundVol(+e.target.value); saveLS('soundVol', +e.target.value) }} />
-                  <span className="val">{Math.round(soundVol * 100)}%</span>
-                </label>
-              )}
+              <label><span>Sound</span><input type="checkbox" checked={soundOn} onChange={e => { const on = e.target.checked; setSoundOn(on); saveLS('soundOn', on); if (on) sfx.click() }} /></label>
+              {soundOn && <label><span>Vol</span><input type="range" min="0" max="1" step="0.05" value={soundVol} onChange={e => { setSoundVol(+e.target.value); saveLS('soundVol', +e.target.value) }} /><span className="val">{Math.round(soundVol * 100)}%</span></label>}
             </div>
           )}
+
+          {/* ── Mobile layout ── */}
+          {IS_MOBILE && <>
+            {/* Top bar: settings | undo | indicator | redo | exit */}
+            <div className="mobile-topbar">
+              <button className="mobile-topbar-btn" onClick={() => setMobileMenu(v => !v)}>{I.settings}</button>
+              <button className="mobile-topbar-btn" onClick={undoShape}>{I.undo}</button>
+              <div className="mobile-tool-indicator" onClick={() => setTool('drag')}>
+                {tool === 'drag' ? I.hand : tool === 'circle' ? I.circle : tool === 'triangle' ? I.tri : tool === 'square' ? I.sq : tool === 'laser' ? I.laser : I.grenade}
+                <span>{tool === 'drag' ? 'Drag' : tool.charAt(0).toUpperCase() + tool.slice(1)}</span>
+              </div>
+              <button className="mobile-topbar-btn" onClick={redoShape}>{I.redo}</button>
+              <button className="mobile-topbar-btn" onClick={exitFullscreen}>{I.close}</button>
+            </div>
+
+            {/* Left sidebar: shapes + drag */}
+            <div className="mobile-sidebar mobile-sidebar-left">
+              <button className={`quickbar-btn${tool === 'drag' ? ' active' : ''}`} onClick={() => setTool('drag')}>{I.hand}</button>
+              <button className={`quickbar-btn${tool === 'circle' ? ' active' : ''}`} onClick={() => setTool(tool === 'circle' ? 'drag' : 'circle')}>{I.circle}</button>
+              <button className={`quickbar-btn${tool === 'triangle' ? ' active' : ''}`} onClick={() => setTool(tool === 'triangle' ? 'drag' : 'triangle')}>{I.tri}</button>
+              <button className={`quickbar-btn${tool === 'square' ? ' active' : ''}`} onClick={() => setTool(tool === 'square' ? 'drag' : 'square')}>{I.sq}</button>
+            </div>
+
+            {/* Right sidebar: weapons + actions */}
+            <div className="mobile-sidebar mobile-sidebar-right">
+              <button className={`quickbar-btn${tool === 'laser' ? ' active' : ''}`} onClick={() => setTool(tool === 'laser' ? 'drag' : 'laser')}>{I.laser}</button>
+              <button className={`quickbar-btn${tool === 'grenade' ? ' active' : ''}`} onClick={() => setTool(tool === 'grenade' ? 'drag' : 'grenade')}>{I.grenade}</button>
+              <button className="quickbar-btn" onClick={shatterAll}>{I.shatter}</button>
+              <button className="quickbar-btn" onClick={() => { setPhysOn(false); doLayout() }}>{I.reset}</button>
+            </div>
+
+            {/* Settings drawer (only settings, no tools/actions) */}
+            {mobileMenu && (
+              <div className="mobile-drawer-overlay" onClick={e => { if (e.target === e.currentTarget) setMobileMenu(false) }}>
+                <div className="mobile-drawer">
+                  <button className="drawer-close" onClick={() => setMobileMenu(false)}>{I.close}</button>
+                  <div className="drawer-section">
+                    <div className="drawer-title">Settings</div>
+                    <label><span>Bounce</span><input type="range" min="0" max="2" step="0.05" value={bounce} onChange={e => handleBounceChange(+e.target.value)} /><span className="val">{bounce.toFixed(2)}</span></label>
+                    <label><span>Floor</span><input type="range" min="1" max="50" step="1" value={floorH} onChange={e => handleFloorHChange(+e.target.value)} /><span className="val">{floorH}px</span></label>
+                    <label><span>FPS</span><input type="checkbox" checked={showFps} onChange={e => toggleFps(e.target.checked)} /></label>
+                    <label><span>Sound</span><input type="checkbox" checked={soundOn} onChange={e => { const on = e.target.checked; setSoundOn(on); saveLS('soundOn', on); if (on) sfx.click() }} /></label>
+                    {soundOn && <label><span>Vol</span><input type="range" min="0" max="1" step="0.05" value={soundVol} onChange={e => { setSoundVol(+e.target.value); saveLS('soundVol', +e.target.value) }} /><span className="val">{Math.round(soundVol * 100)}%</span></label>}
+                  </div>
+                </div>
+              </div>
+            )}
+          </>}
 
           {recBlob && (
             <div className="rec-modal" onClick={e => {
@@ -1229,7 +1320,7 @@ export default function App() {
                 <video src={recBlob.url} controls autoPlay style={{ width: '100%', borderRadius: 8 }} />
                 <div className="rec-modal-actions">
                   <button className="btn primary" onClick={downloadWebm}>Download WebM</button>
-                  <button className="btn ghost" onClick={convertMp4}>{mp4Progress || 'Convert to MP4'}</button>
+                  {!IS_MOBILE && <button className="btn ghost" onClick={convertMp4}>{mp4Progress || 'Convert to MP4'}</button>}
                   <button className="btn ghost" onClick={() => { URL.revokeObjectURL(recBlob.url); setRecBlob(null); setMp4Progress('') }}>Close</button>
                 </div>
               </div>
