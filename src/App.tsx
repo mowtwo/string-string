@@ -127,6 +127,7 @@ export default function App() {
   const [soundVol, setSoundVol] = useState(() => loadLS('soundVol', 0.5))
 
   const [fighterMode, setFighterMode] = useState(false)
+  const [showFighterTip, setShowFighterTip] = useState(() => !loadLS('fighterTipDismissed', false))
   const fighterRef = useRef(createFighterState())
   const [isRec, setIsRec] = useState(false)
   const [recBlob, setRecBlob] = useState<{ blob: Blob; mime: string; url: string } | null>(null)
@@ -1203,7 +1204,7 @@ export default function App() {
   const enterFighterMode = () => {
     if (!physRef.current) goPhysics()
     const cw = window.innerWidth, ch = window.innerHeight
-    initFighter(fighterRef.current, cw, ch, getEngine(), IS_MOBILE)
+    initFighter(fighterRef.current, cw, ch, getEngine(), IS_MOBILE, linesRef.current)
     setFighterMode(true)
   }
   const exitFighterMode = () => {
@@ -1216,7 +1217,7 @@ export default function App() {
     doLayout().then(() => {
       goPhysics()
       const cw = window.innerWidth, ch = window.innerHeight
-      initFighter(fighterRef.current, cw, ch, getEngine(), IS_MOBILE)
+      initFighter(fighterRef.current, cw, ch, getEngine(), IS_MOBILE, linesRef.current)
     })
   }
   // handle game over click/tap to restart
@@ -1309,6 +1310,15 @@ export default function App() {
               <button className="fighter-ult-btn" onTouchStart={e => { e.preventDefault(); fighterRef.current.keys.ultimate = true }} onTouchEnd={() => { fighterRef.current.keys.ultimate = false }}>ULT</button>
             </>}
           </>}
+
+          {/* ── Fighter mode recommendation (first time only) ── */}
+          {!fighterMode && showFighterTip && (
+            <div className="fighter-tip">
+              <span>Try <strong>Fighter Mode</strong> — pilot a spaceship through your text!</span>
+              <button onClick={() => { setShowFighterTip(false); saveLS('fighterTipDismissed', true); enterFighterMode() }}>Play</button>
+              <button className="dismiss" onClick={() => { setShowFighterTip(false); saveLS('fighterTipDismissed', true) }}>Maybe later</button>
+            </div>
+          )}
 
           {/* ── Desktop toolbar ── */}
           {!fighterMode && !IS_MOBILE && <div className="toolbar desktop-only">

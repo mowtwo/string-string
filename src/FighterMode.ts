@@ -95,7 +95,10 @@ export function createFighterState(): FighterState {
   }
 }
 
-export function initFighter(state: FighterState, cw: number, ch: number, engine: Matter.Engine, isMobile: boolean) {
+export function initFighter(
+  state: FighterState, cw: number, ch: number, engine: Matter.Engine, isMobile: boolean,
+  lines: { chars: { body: Matter.Body }[]; pins: Matter.Constraint[]; released: boolean }[],
+) {
   state.active = true
   state.x = cw / 2; state.y = ch / 2
   state.angle = -Math.PI / 2
@@ -152,6 +155,21 @@ export function initFighter(state: FighterState, cw: number, ch: number, engine:
     }
     for (const hc of hintChars) hc.free = true
   }, 1000)
+
+  // release all existing text pins after 1s so they fall naturally
+  setTimeout(() => {
+    for (const line of lines) {
+      if (line.released) continue
+      for (const pin of line.pins) Composite.remove(engine.world, pin)
+      line.pins = []; line.released = true
+      // wake up sleeping bodies so gravity takes effect immediately
+      for (const { body } of line.chars) {
+        Body.setStatic(body, false) // ensure dynamic
+        ;(body as any).isSleeping = false
+        Body.setVelocity(body, { x: 0, y: 0.1 }) // tiny nudge to wake physics
+      }
+    }
+  }, 1000)
 }
 
 export function updateFighter(
@@ -194,9 +212,15 @@ export function updateFighter(
   state.vx = state.vx * 0.92 + ax
   state.vy = state.vy * 0.92 + ay
   state.x += state.vx; state.y += state.vy
-  // clamp to canvas
+  // clamp to canvas + bounce off floor
   state.x = Math.max(20, Math.min(cw - 20, state.x))
-  state.y = Math.max(20, Math.min(floorY - 20, state.y))
+  if (state.y > floorY - 20) {
+    state.y = floorY - 20
+    state.vy = -Math.abs(state.vy) - 4 // bounce up
+    state.angle = -state.angle // flip direction
+    sfx.bounce()
+  }
+  state.y = Math.max(20, state.y)
 
   // ── energy charge: 1 bar per 60s ──
   state.energy = Math.min(MAX_ENERGY, 0.5 + (now - state.startTime) / ENERGY_CHARGE_TIME)
@@ -230,14 +254,16 @@ export function updateFighter(
         Composite.remove(engine.world, ft.body); state.fallingTexts.splice(fi, 1); state.score += 1
       }
     }
-    // also blast existing text
+    // blast existing text in radius
     for (const line of lines) {
       for (const { body } of line.chars) {
         const d = Math.hypot(body.position.x - state.x, body.position.y - state.y)
         if (d < radius) {
-          releasePinOnBody(body)
+          for (const c of [...Composite.allConstraints(engine.world)]) {
+            if (c.bodyA === body || c.bodyB === body) Composite.remove(engine.world, c)
+          }
           const a = Math.atan2(body.position.y - state.y, body.position.x - state.x)
-          Body.setVelocity(body, { x: Math.cos(a) * 10, y: Math.sin(a) * 10 })
+          Body.setVelocity(body, { x: Math.cos(a) * 12, y: Math.sin(a) * 12 })
         }
       }
     }
@@ -266,25 +292,17 @@ export function updateFighter(
     if (b.x < -20 || b.x > cw + 20 || b.y < -20 || b.y > ch + 20) {
       state.bullets.splice(bi, 1); continue
     }
-    // hit existing text
+    // hit existing text (pins already released after 1s, just break rope + knockback)
     let consumed = false
     for (const line of lines) {
       for (let ci = line.chars.length - 1; ci >= 0; ci--) {
         const { body } = line.chars[ci]
         if (Math.hypot(body.position.x - b.x, body.position.y - b.y) < 20) {
-          // release pin on this char + neighbors so it can actually move
-          // release pins on this char + 2 neighbors each side
-          for (let n = Math.max(0, ci - 2); n <= Math.min(line.chars.length - 1, ci + 2); n++) {
-            releasePinOnBody(line.chars[n].body)
+          // break rope constraints on this body
+          for (const c of [...Composite.allConstraints(engine.world)]) {
+            if (c.bodyA === body || c.bodyB === body) Composite.remove(engine.world, c)
           }
-          // remove ALL constraints touching this body
-          const allC = Composite.allConstraints(engine.world)
-          for (let ci2 = allC.length - 1; ci2 >= 0; ci2--) {
-            if (allC[ci2].bodyA === body || allC[ci2].bodyB === body) {
-              Composite.remove(engine.world, allC[ci2])
-            }
-          }
-          Body.setVelocity(body, { x: b.dx * 1.5, y: b.dy * 1.5 })
+          Body.setVelocity(body, { x: b.dx * 2, y: b.dy * 2 })
           sfx.laserHit()
           consumed = true; break
         }
