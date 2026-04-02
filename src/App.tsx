@@ -2,6 +2,7 @@ import { useRef, useState, useEffect, useCallback } from 'react'
 import Matter from 'matter-js'
 import { SoundFX } from './SoundFX'
 import { Recorder } from './Recorder'
+import { createFighterState, initFighter, updateFighter, drawFighter, drawFighterHUD, cleanupFighter } from './FighterMode'
 import './App.css'
 
 const sfx = new SoundFX()
@@ -125,6 +126,8 @@ export default function App() {
   const [soundOn, setSoundOn] = useState(() => loadLS('soundOn', false))
   const [soundVol, setSoundVol] = useState(() => loadLS('soundVol', 0.5))
 
+  const [fighterMode, setFighterMode] = useState(false)
+  const fighterRef = useRef(createFighterState())
   const [isRec, setIsRec] = useState(false)
   const [recBlob, setRecBlob] = useState<{ blob: Blob; mime: string; url: string } | null>(null)
   const [mp4Progress, setMp4Progress] = useState('')
@@ -421,6 +424,10 @@ export default function App() {
 
         // ── update systems ──
         updateLasers(dtSec)
+        // fighter mode update
+        if (fighterRef.current.active) {
+          updateFighter(fighterRef.current, dtSec, cw, ch, floorHRef.current, IS_MOBILE, engine, sfx, linesRef.current, releasePinOnBody)
+        }
         updateGrenades()
         const explosions = explosionsRef.current
         for (let ei = explosions.length - 1; ei >= 0; ei--) {
@@ -631,6 +638,9 @@ export default function App() {
           }
         }
 
+        // fighter mode (in world space)
+        if (fighterRef.current.active) drawFighter(ctx, fighterRef.current, z)
+
         // fps body (in world space)
         const fpsBody = fpsBodyRef.current
         if (fpsBody && showFpsRef.current) {
@@ -662,6 +672,8 @@ export default function App() {
           ctx.fillText(`${Math.round(z * 100)}%`, cw - 16, ch - 16)
           ctx.textAlign = 'left'
         }
+        // fighter HUD (screen space, inside DPR scale)
+        if (fighterRef.current.active) drawFighterHUD(ctx, fighterRef.current, cw, ch, IS_MOBILE)
         ctx.restore() // close DPR scale
       }
       raf = requestAnimationFrame(loop)
@@ -724,8 +736,32 @@ export default function App() {
 
   /* ═══════ keyboard ═══════ */
   useEffect(() => {
+    const onKeyUp = (e: KeyboardEvent) => {
+      const f = fighterRef.current
+      if (!f.active) return
+      const k = e.key.toLowerCase()
+      if (k === 'w' || k === 'arrowup') f.keys.up = false
+      if (k === 's' || k === 'arrowdown') f.keys.down = false
+      if (k === 'a' || k === 'arrowleft') f.keys.left = false
+      if (k === 'd' || k === 'arrowright') f.keys.right = false
+      if (k === 'j') f.keys.fire = false
+      if (k === ' ') f.keys.ultimate = false
+    }
     const onKey = (e: KeyboardEvent) => {
       if (!fullscreenRef.current) return
+      // fighter mode input
+      const f = fighterRef.current
+      if (f.active) {
+        if (e.key === 'Escape') { exitFighterMode(); e.preventDefault(); return }
+        const k = e.key.toLowerCase()
+        if (k === 'w' || k === 'arrowup') { f.keys.up = true; e.preventDefault() }
+        if (k === 's' || k === 'arrowdown') { f.keys.down = true; e.preventDefault() }
+        if (k === 'a' || k === 'arrowleft') { f.keys.left = true; e.preventDefault() }
+        if (k === 'd' || k === 'arrowright') { f.keys.right = true; e.preventDefault() }
+        if (k === 'j') { f.keys.fire = true; e.preventDefault() }
+        if (k === ' ') { f.keys.ultimate = true; e.preventDefault() }
+        return
+      }
       const meta = e.metaKey || e.ctrlKey
       if (!meta && !e.shiftKey) {
         if (e.key === 'Escape') { setTool('drag'); e.preventDefault(); return }
@@ -749,7 +785,8 @@ export default function App() {
       if ((meta && e.shiftKey && e.key === 'z') || (meta && e.key === 'y')) { redoShape(); e.preventDefault() }
     }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    window.addEventListener('keyup', onKeyUp)
+    return () => { window.removeEventListener('keydown', onKey); window.removeEventListener('keyup', onKeyUp) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -1156,9 +1193,35 @@ export default function App() {
     zoomReset: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/><path d="M8 11h6M11 8v6"/></svg>,
     settings: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>,
     shatter: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>,
+    fighter: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2L8 10h8L12 2z"/><path d="M8 10l-4 8h16l-4-8"/><path d="M12 10v12"/></svg>,
     menu: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M3 12h18M3 6h18M3 18h18"/></svg>,
     rec: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="6" fill="currentColor"/></svg>,
     close: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>,
+  }
+
+  // ── Fighter mode ──
+  const enterFighterMode = () => {
+    if (!physRef.current) goPhysics()
+    const cw = window.innerWidth, ch = window.innerHeight
+    initFighter(fighterRef.current, cw, ch, getEngine(), IS_MOBILE)
+    setFighterMode(true)
+  }
+  const exitFighterMode = () => {
+    cleanupFighter(fighterRef.current, getEngine())
+    setFighterMode(false)
+  }
+  const restartFighter = () => {
+    cleanupFighter(fighterRef.current, getEngine())
+    // reset text to original positions
+    doLayout().then(() => {
+      goPhysics()
+      const cw = window.innerWidth, ch = window.innerHeight
+      initFighter(fighterRef.current, cw, ch, getEngine(), IS_MOBILE)
+    })
+  }
+  // handle game over click/tap to restart
+  const handleFighterGameOverClick = () => {
+    if (fighterRef.current.gameOver) restartFighter()
   }
 
   const toggleRec = () => {
@@ -1231,8 +1294,24 @@ export default function App() {
 
       {fullscreen && (
         <>
+          {/* ── Fighter mode overlay ── */}
+          {fighterMode && <>
+            <button className="fighter-exit-btn" onClick={exitFighterMode} title="Exit fighter">{I.close}</button>
+            {!IS_MOBILE && <button className="fighter-rec-btn" onClick={toggleRec} title={isRec ? 'Stop recording' : 'Record'}><span className={isRec ? 'recording' : ''}>{I.rec}</span></button>}
+            {fighterRef.current.gameOver && (
+              <div className="fighter-gameover-overlay" onClick={handleFighterGameOverClick} onTouchStart={handleFighterGameOverClick} />
+            )}
+            {IS_MOBILE && !fighterRef.current.gameOver && <>
+              <div className="fighter-joystick" onTouchStart={e => { e.preventDefault(); const t = e.touches[0]; const rect = (e.target as HTMLElement).getBoundingClientRect(); const cx = rect.left + rect.width/2, cy = rect.top + rect.height/2; const dx = t.clientX - cx, dy = t.clientY - cy; fighterRef.current.joyAngle = Math.atan2(dy, dx); fighterRef.current.joyMag = Math.min(1, Math.hypot(dx, dy) / (rect.width/2)) }} onTouchMove={e => { e.preventDefault(); const t = e.touches[0]; const rect = (e.currentTarget as HTMLElement).getBoundingClientRect(); const cx = rect.left + rect.width/2, cy = rect.top + rect.height/2; const dx = t.clientX - cx, dy = t.clientY - cy; fighterRef.current.joyAngle = Math.atan2(dy, dx); fighterRef.current.joyMag = Math.min(1, Math.hypot(dx, dy) / (rect.width/2)) }} onTouchEnd={() => { fighterRef.current.joyMag = 0 }}>
+                <div className="joystick-ring" />
+              </div>
+              <button className="fighter-fire-btn" onTouchStart={e => { e.preventDefault(); fighterRef.current.keys.fire = true }} onTouchEnd={() => { fighterRef.current.keys.fire = false }}>FIRE</button>
+              <button className="fighter-ult-btn" onTouchStart={e => { e.preventDefault(); fighterRef.current.keys.ultimate = true }} onTouchEnd={() => { fighterRef.current.keys.ultimate = false }}>ULT</button>
+            </>}
+          </>}
+
           {/* ── Desktop toolbar ── */}
-          {!IS_MOBILE && <div className="toolbar desktop-only">
+          {!fighterMode && !IS_MOBILE && <div className="toolbar desktop-only">
             <button className={`tool-btn${tool === 'drag' ? ' active' : ''}`} onClick={() => setTool('drag')} title="Drag (Esc)">{I.hand}<kbd>Esc</kbd></button>
             <div className="tool-sep" />
             <button className={`tool-btn${tool === 'circle' ? ' active' : ''}`} onClick={() => setTool('circle')} title="Circle (1)">{I.circle}<kbd>1</kbd></button>
@@ -1248,12 +1327,13 @@ export default function App() {
             <button className="tool-btn" onClick={() => { setPhysOn(false); doLayout() }} title="Reset (R)">{I.reset}<kbd>R</kbd></button>
             <button className="tool-btn" onClick={() => { zoomRef.current = 1; panRef.current = { x: 0, y: 0 } }} title="Fit (0)">{I.zoomReset}<kbd>0</kbd></button>
             <button className={`tool-btn${showPanel ? ' active' : ''}`} onClick={() => setShowPanel(v => !v)} title="Settings">{I.settings}</button>
+            <button className="tool-btn" onClick={enterFighterMode} title="Fighter mode">{I.fighter}</button>
             <button className={`tool-btn${isRec ? ' recording' : ''}`} onClick={toggleRec} title={isRec ? 'Stop recording' : 'Record'}>{I.rec}</button>
             <button className="tool-btn exit-btn" onClick={exitFullscreen} title="Back">{I.close}</button>
           </div>}
 
           {/* ── Desktop settings panel ── */}
-          {!IS_MOBILE && showPanel && (
+          {!fighterMode && !IS_MOBILE && showPanel && (
             <div className="settings-panel">
               <label><span>Bounce</span><input type="range" min="0" max="2" step="0.05" value={bounce} onChange={e => handleBounceChange(+e.target.value)} /><span className="val">{bounce.toFixed(2)}</span></label>
               <label><span>Floor</span><input type="range" min="1" max="50" step="1" value={floorH} onChange={e => handleFloorHChange(+e.target.value)} /><span className="val">{floorH}px</span></label>
@@ -1265,7 +1345,7 @@ export default function App() {
           )}
 
           {/* ── Mobile layout ── */}
-          {IS_MOBILE && <>
+          {!fighterMode && IS_MOBILE && <>
             {/* Top bar: settings | undo | indicator | redo | exit */}
             <div className="mobile-topbar">
               <button className="mobile-topbar-btn" onClick={() => setMobileMenu(v => !v)}>{I.settings}</button>
@@ -1292,6 +1372,7 @@ export default function App() {
               <button className={`quickbar-btn${tool === 'grenade' ? ' active' : ''}`} onClick={() => setTool(tool === 'grenade' ? 'drag' : 'grenade')}>{I.grenade}</button>
               <button className="quickbar-btn" onClick={shatterAll}>{I.shatter}</button>
               <button className="quickbar-btn" onClick={() => { setPhysOn(false); doLayout() }}>{I.reset}</button>
+              <button className="quickbar-btn" onClick={enterFighterMode}>{I.fighter}</button>
             </div>
 
             {/* Settings drawer (only settings, no tools/actions) */}
